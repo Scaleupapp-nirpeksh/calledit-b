@@ -195,7 +195,7 @@ async def create_match_winner_prediction(
     match_id: str,
     predicted_winner: str,
 ) -> dict:
-    """Create or update match winner prediction (max 2 changes allowed)."""
+    """Create match winner prediction (one-time only, cannot be changed)."""
     match = await match_service.get_match(match_id)
     if not match:
         raise ValueError("Match not found")
@@ -215,18 +215,7 @@ async def create_match_winner_prediction(
     now = utc_now()
 
     if existing:
-        changes = existing.get("winner_changes", 0)
-        if changes >= MAX_WINNER_CHANGES:
-            raise ValueError(f"Maximum {MAX_WINNER_CHANGES} winner prediction changes allowed")
-        await db.predictions.update_one(
-            {"_id": existing["_id"]},
-            {
-                "$set": {"prediction": predicted_winner, "updated_at": now},
-                "$inc": {"winner_changes": 1},
-            },
-        )
-        existing["prediction"] = predicted_winner
-        return existing
+        raise ValueError("Winner prediction already submitted — cannot be changed")
 
     pred_doc = {
         "_id": generate_nanoid(),
@@ -415,23 +404,48 @@ async def resolve_over_predictions(
     return count
 
 
+def _player_name_matches(predicted_name: str, actual_name: str) -> bool:
+    """Fuzzy match player names. Handles partial names like 'Shaheen' matching 'Shaheen Shah Afridi'."""
+    p = predicted_name.lower().strip()
+    a = actual_name.lower().strip()
+    if p == a:
+        return True
+    # Check if predicted name is a substring of actual or vice versa
+    if p in a or a in p:
+        return True
+    # Check if predicted last name matches actual last name
+    p_parts = p.split()
+    a_parts = a.split()
+    if p_parts and a_parts and p_parts[-1] == a_parts[-1]:
+        return True
+    return False
+
+
 async def resolve_milestone_predictions(
     match_id: str,
     milestone_type: str,
     player_name: str,
     actually_achieved: bool,
 ) -> int:
-    """Resolve all milestone predictions for a specific player/milestone. Returns count resolved."""
+    """Resolve all milestone predictions for a specific player/milestone.
+    Uses fuzzy name matching so 'Shaheen' matches 'Shaheen Shah Afridi'."""
     db = get_db()
-    milestone_key = f"{milestone_type}:{player_name}"
 
+    # Find all unresolved milestone predictions for this match + type
     cursor = db.predictions.find({
         "match_id": match_id,
-        "ball_key": milestone_key,
         "type": PredictionType.MILESTONE,
         "is_resolved": False,
+        "ball_key": {"$regex": f"^{milestone_type}:"},
     })
-    predictions = await cursor.to_list(length=10000)
+    all_preds = await cursor.to_list(length=10000)
+
+    # Filter to predictions that fuzzy-match this player name
+    predictions = []
+    for pred in all_preds:
+        predicted_player = pred["ball_key"].split(":", 1)[1] if ":" in pred["ball_key"] else ""
+        if _player_name_matches(predicted_player, player_name):
+            predictions.append(pred)
     count = 0
 
     for pred in predictions:

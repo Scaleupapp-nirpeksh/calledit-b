@@ -95,6 +95,46 @@ async def get_scorecard(match_id: str):
     }
 
 
+@router.get("/{match_id}/players")
+async def get_match_players(match_id: str):
+    """Get player names for a match — used for milestone prediction dropdowns."""
+    match = await match_service.get_match(match_id)
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    players = {"team1": match.get("team1", ""), "team2": match.get("team2", ""),
+               "team1_code": match.get("team1_code", ""), "team2_code": match.get("team2_code", ""),
+               "batters": [], "bowlers": []}
+    seen_batters = set()
+    seen_bowlers = set()
+
+    # Extract from scorecard (completed matches)
+    for inn in match.get("scorecard", []) or []:
+        for b in inn.get("batting", []):
+            name = b.get("batsman", {}).get("name", "") if isinstance(b.get("batsman"), dict) else b.get("batsman", "")
+            if name and name not in seen_batters:
+                seen_batters.add(name)
+                players["batters"].append(name)
+        for b in inn.get("bowling", []):
+            name = b.get("bowler", {}).get("name", "") if isinstance(b.get("bowler"), dict) else b.get("bowler", "")
+            if name and name not in seen_bowlers:
+                seen_bowlers.add(name)
+                players["bowlers"].append(name)
+
+    # Extract from ball_log (live matches)
+    for ball in match.get("ball_log", []):
+        batter = ball.get("batter", "")
+        bowler = ball.get("bowler", "")
+        if batter and batter not in seen_batters:
+            seen_batters.add(batter)
+            players["batters"].append(batter)
+        if bowler and bowler not in seen_bowlers:
+            seen_bowlers.add(bowler)
+            players["bowlers"].append(bowler)
+
+    return players
+
+
 @router.get("/{match_id}/timeline")
 async def get_timeline(match_id: str, innings: int = 1):
     """Get ball-by-ball timeline for a match innings."""
