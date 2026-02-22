@@ -194,7 +194,14 @@ async def get_ai_report(match_id: str):
         match = await match_service.get_match(match_id)
         if not match:
             raise HTTPException(status_code=404, detail="Match not found")
-        if match.get("status") != "completed":
+        if match.get("status") == "abandoned":
+            return {
+                "match_id": match_id,
+                "content": match.get("result_text", "Match abandoned"),
+                "generated_at": match.get("updated_at"),
+                "abandoned": True,
+            }
+        if match.get("status") not in ("completed",):
             raise HTTPException(status_code=404, detail="Match not completed yet")
         from app.services.ai_content_service import generate_post_match_report
         try:
