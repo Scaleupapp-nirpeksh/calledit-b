@@ -317,9 +317,9 @@ async def _sync_from_current_matches(match: dict, current_matches: list[dict]) -
     elif runs_scored == 0:
         outcome = BallOutcome.DOT.value
     elif runs_scored == 1:
-        outcome = BallOutcome.SINGLE.value
+        outcome = BallOutcome.ONE.value
     elif runs_scored == 2:
-        outcome = BallOutcome.DOUBLE.value
+        outcome = BallOutcome.TWO.value
     elif runs_scored == 3:
         outcome = BallOutcome.THREE.value
     elif runs_scored == 4:
@@ -327,7 +327,7 @@ async def _sync_from_current_matches(match: dict, current_matches: list[dict]) -
     elif runs_scored >= 6:
         outcome = BallOutcome.SIX.value
     else:
-        outcome = BallOutcome.SINGLE.value
+        outcome = BallOutcome.ONE.value
 
     bk = ball_key(bowled_innings, bowled_over, bowled_ball)
     now = utc_now()
