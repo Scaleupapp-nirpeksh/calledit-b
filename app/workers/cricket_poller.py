@@ -5,12 +5,14 @@ For each new delivery: close window → classify → append → resolve → emit
 """
 
 import asyncio
+import json
 import logging
+from datetime import timedelta
 
 from app.redis_client import get_redis
 from app.services import cricket_data_service, match_service
 from app.services.ml_service import get_ball_probabilities, get_win_probability
-from app.utils.constants import BallOutcome, MatchStatus
+from app.utils.constants import BallOutcome, MatchStatus, PREDICTION_WINDOW_SECONDS
 from app.utils.helpers import ball_key, classify_delivery_outcome, utc_now
 from app.websocket.events import (
     emit_ball_update,
@@ -188,8 +190,9 @@ async def _poll_match(match: dict, current_matches: list[dict]) -> None:
 
 
 async def _sync_from_current_matches(match: dict, current_matches: list[dict]) -> None:
-    """Sync match status and scores from currentMatches API data.
-    This handles all status transitions and score updates regardless of bbb availability."""
+    """Sync match status, scores, and infer balls from currentMatches API data.
+    This handles all status transitions, score updates, ball inference,
+    prediction windows, and ball events — regardless of bbb availability."""
     match_id = match["_id"]
     cricapi_id = match.get("cricapi_id")
     current_status = match.get("status")
@@ -219,8 +222,14 @@ async def _sync_from_current_matches(match: dict, current_matches: list[dict]) -
     if current_status == MatchStatus.TOSS and match_started:
         await match_service.update_match_status(match_id, MatchStatus.LIVE_1ST)
         await emit_match_status_change(match_id, MatchStatus.LIVE_1ST)
+        # Open first prediction window
+        now = utc_now()
+        closes_at = (now + timedelta(seconds=PREDICTION_WINDOW_SECONDS)).isoformat()
         await match_service.open_prediction_window(match_id)
-        await emit_prediction_window(match_id, True, "1.1.1")
+        await emit_prediction_window(
+            match_id, True, ball_key(1, 1, 1),
+            innings=1, over=1, ball=1, closes_at=closes_at,
+        )
         logger.info(f"Match {match_id}: TOSS → LIVE_1ST")
         current_status = MatchStatus.LIVE_1ST
 
@@ -230,13 +239,187 @@ async def _sync_from_current_matches(match: dict, current_matches: list[dict]) -
         await emit_match_status_change(match_id, MatchStatus.LIVE_2ND)
         logger.info(f"Match {match_id}: LIVE_1ST → LIVE_2ND (innings break)")
 
-    # --- Score updates from currentMatches (works even without bbb) ---
-    if score:
-        from app.database import get_db
-        db = get_db()
-        update = {"score": score, "result_text": api_status, "updated_at": utc_now()}
-        await db.matches.update_one({"_id": match_id}, {"$set": update})
-        await emit_score_update(match_id, {"score": score, "status_text": api_status})
+    # --- Score updates + ball inference ---
+    if not score:
+        return
+
+    from app.database import get_db
+    db = get_db()
+
+    # Always update the score in DB
+    update = {"score": score, "result_text": api_status, "updated_at": utc_now()}
+    await db.matches.update_one({"_id": match_id}, {"$set": update})
+    await emit_score_update(match_id, {"score": score, "status_text": api_status})
+
+    # --- Ball inference: detect new balls from overs changing ---
+    redis = get_redis()
+    snapshot_key = f"score_snapshot:{match_id}"
+
+    # Get the current innings score (last entry = active innings)
+    active = score[-1]
+    cur_r = active.get("r", 0)
+    cur_w = active.get("w", 0)
+    cur_o = active.get("o", 0)  # e.g. 6.4 means 6 overs + 4 balls
+    cur_innings_idx = len(score)  # 1 for first innings, 2 for second
+
+    # Load previous snapshot
+    prev_raw = await redis.get(snapshot_key)
+    if prev_raw:
+        prev = json.loads(prev_raw)
+    else:
+        # First time — save snapshot and open prediction window for current ball
+        prev = {"r": cur_r, "w": cur_w, "o": cur_o, "innings": cur_innings_idx}
+        await redis.set(snapshot_key, json.dumps(prev))
+        # Open window for the next ball
+        next_over, next_ball = _next_ball_from_overs(cur_o)
+        now = utc_now()
+        closes_at = (now + timedelta(seconds=PREDICTION_WINDOW_SECONDS)).isoformat()
+        bk = ball_key(cur_innings_idx, next_over, next_ball)
+        await match_service.open_prediction_window(match_id)
+        await emit_prediction_window(
+            match_id, True, bk,
+            innings=cur_innings_idx, over=next_over, ball=next_ball,
+            closes_at=closes_at,
+        )
+        return
+
+    prev_o = prev.get("o", 0)
+    prev_r = prev.get("r", 0)
+    prev_w = prev.get("w", 0)
+    prev_innings = prev.get("innings", 1)
+
+    # Check if innings changed
+    innings_changed = cur_innings_idx != prev_innings
+
+    # Check if overs changed (new ball bowled)
+    overs_changed = cur_o != prev_o or innings_changed
+
+    if not overs_changed:
+        return  # No new ball, nothing to do
+
+    # --- A ball (or multiple balls) was bowled ---
+    # Infer the ball that just happened
+    if innings_changed:
+        # New innings started — the ball was the last ball of previous innings
+        bowled_innings = prev_innings
+        bowled_over, bowled_ball = _current_ball_from_overs(prev_o)
+        runs_scored = 0
+        wicket_fell = False
+    else:
+        bowled_innings = cur_innings_idx
+        bowled_over, bowled_ball = _current_ball_from_overs(cur_o)
+        runs_scored = cur_r - prev_r
+        wicket_fell = cur_w > prev_w
+
+    # Classify the outcome
+    if wicket_fell:
+        outcome = BallOutcome.WICKET.value
+    elif runs_scored == 0:
+        outcome = BallOutcome.DOT.value
+    elif runs_scored == 1:
+        outcome = BallOutcome.SINGLE.value
+    elif runs_scored == 2:
+        outcome = BallOutcome.DOUBLE.value
+    elif runs_scored == 3:
+        outcome = BallOutcome.THREE.value
+    elif runs_scored == 4:
+        outcome = BallOutcome.FOUR.value
+    elif runs_scored >= 6:
+        outcome = BallOutcome.SIX.value
+    else:
+        outcome = BallOutcome.SINGLE.value
+
+    bk = ball_key(bowled_innings, bowled_over, bowled_ball)
+    now = utc_now()
+
+    # 1. Close prediction window for the ball that was bowled
+    await match_service.close_prediction_window(match_id)
+    await emit_prediction_window(match_id, False, bk)
+
+    # 2. Build and emit ball_update
+    ball_entry = {
+        "innings": bowled_innings,
+        "over": bowled_over,
+        "ball": bowled_ball,
+        "ball_key": bk,
+        "batter": "",
+        "bowler": "",
+        "non_striker": "",
+        "batter_runs": runs_scored if not wicket_fell else 0,
+        "extras": 0,
+        "total_runs": runs_scored,
+        "outcome": outcome,
+        "is_wicket": wicket_fell,
+        "wicket_kind": None,
+        "player_out": None,
+        "timestamp": now,
+        "inferred": True,  # Flag: inferred from score, not bbb
+    }
+
+    # Append to ball_log in DB
+    await match_service.append_ball(match_id, ball_entry)
+    await emit_ball_update(match_id, ball_entry)
+
+    # 3. Resolve predictions for this ball
+    await process_ball_result(match_id, bk, outcome, bowled_over)
+
+    logger.info(
+        f"Match {match_id}: Inferred ball {bk} — {outcome} "
+        f"(+{runs_scored}r, wkt={wicket_fell}) [{cur_r}/{cur_w} ({cur_o}ov)]"
+    )
+
+    # 4. Open prediction window for the NEXT ball
+    if not innings_changed:
+        next_over, next_ball = _next_ball_from_overs(cur_o)
+        next_innings = cur_innings_idx
+    else:
+        next_over, next_ball = 1, 1
+        next_innings = cur_innings_idx
+
+    next_bk = ball_key(next_innings, next_over, next_ball)
+    closes_at = (now + timedelta(seconds=PREDICTION_WINDOW_SECONDS)).isoformat()
+    await match_service.open_prediction_window(match_id)
+    await emit_prediction_window(
+        match_id, True, next_bk,
+        innings=next_innings, over=next_over, ball=next_ball,
+        closes_at=closes_at,
+    )
+
+    # 5. Save new snapshot
+    await redis.set(snapshot_key, json.dumps({
+        "r": cur_r, "w": cur_w, "o": cur_o, "innings": cur_innings_idx,
+    }))
+
+
+def _current_ball_from_overs(overs: float) -> tuple[int, int]:
+    """Convert CricAPI overs (e.g. 6.4) to (over_number, ball_number).
+    6.4 → over 7, ball 4 (we're in the 7th over, 4th ball just bowled).
+    5.0 → over 5, ball 6 (5th over complete, last ball was ball 6).
+    """
+    full_overs = int(overs)
+    balls = round((overs - full_overs) * 10)
+    if balls == 0:
+        # e.g. 5.0 means over 5 just completed — last ball was over 5, ball 6
+        return full_overs, 6
+    return full_overs + 1, balls
+
+
+def _next_ball_from_overs(overs: float) -> tuple[int, int]:
+    """Given current overs (e.g. 6.4), return the next ball (over, ball).
+    6.4 → next is over 7, ball 5.
+    6.5 → next is over 7, ball 6. (last ball of over)
+    7.0 → next is over 8, ball 1. (new over starts)
+    """
+    full_overs = int(overs)
+    balls = round((overs - full_overs) * 10)
+    if balls == 0:
+        # Over just completed — next is first ball of next over
+        return full_overs + 1, 1
+    if balls >= 5:
+        # Last ball of over — but CricAPI might show 6 as 0 of next
+        # Actually in cricket .5 is 5th ball, next is 6th ball same over
+        return full_overs + 1, balls + 1
+    return full_overs + 1, balls + 1
 
 
 async def _process_delivery(match_id: str, delivery: dict) -> None:
@@ -310,8 +493,19 @@ async def _process_delivery(match_id: str, delivery: dict) -> None:
 
     # 10. Re-open prediction window for next ball
     await match_service.open_prediction_window(match_id)
-    next_bk = ball_key(delivery["innings"], delivery["over"], delivery["ball"] + 1)
-    await emit_prediction_window(match_id, True, next_bk)
+    next_ball_num = delivery["ball"] + 1
+    next_over_num = delivery["over"]
+    if next_ball_num > 6:
+        next_ball_num = 1
+        next_over_num += 1
+    next_bk = ball_key(delivery["innings"], next_over_num, next_ball_num)
+    now_ts = utc_now()
+    closes_at = (now_ts + timedelta(seconds=PREDICTION_WINDOW_SECONDS)).isoformat()
+    await emit_prediction_window(
+        match_id, True, next_bk,
+        innings=delivery["innings"], over=next_over_num, ball=next_ball_num,
+        closes_at=closes_at,
+    )
 
 
 async def _handle_over_complete(match_id: str, innings: int, over: int) -> None:

@@ -81,13 +81,27 @@ async def emit_ball_update(match_id: str, ball_data: dict) -> None:
     await sio.emit("ball_update", ball_data, room=f"match:{match_id}")
 
 
-async def emit_prediction_window(match_id: str, is_open: bool, ball_key: str = "") -> None:
+async def emit_prediction_window(
+    match_id: str,
+    is_open: bool,
+    ball_key: str = "",
+    innings: int = 0,
+    over: int = 0,
+    ball: int = 0,
+    closes_at: str = "",
+) -> None:
     """Notify clients that prediction window opened/closed."""
-    await sio.emit(
-        "prediction_window",
-        {"match_id": match_id, "is_open": is_open, "ball_key": ball_key},
-        room=f"match:{match_id}",
-    )
+    payload = {
+        "match_id": match_id,
+        "isOpen": is_open,
+        "ball_key": ball_key,
+    }
+    if is_open:
+        payload["innings"] = innings
+        payload["over"] = over
+        payload["ball"] = ball
+        payload["closesAt"] = closes_at
+    await sio.emit("prediction_window", payload, room=f"match:{match_id}")
 
 
 async def emit_score_update(match_id: str, score_data: dict) -> None:
