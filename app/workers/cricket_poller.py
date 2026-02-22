@@ -92,18 +92,31 @@ async def _check_upcoming_matches(current_matches: list[dict]) -> None:
 
                 api_status = m.get("status", "").lower()
                 match_started = m.get("matchStarted", False)
+                match_ended = m.get("matchEnded", False)
 
                 prev_status = match.get("status")
+
+                # Detect toss from status text when tossWinner field is missing
+                toss_winner = m.get("tossWinner")
+                toss_decision = m.get("tossChoice")
+                toss_keywords = ["opt to bat", "opt to bowl", "elected to", "chose to"]
+                toss_detected = toss_winner or any(kw in api_status for kw in toss_keywords)
+
+                if not toss_winner and toss_detected:
+                    # Parse toss info from status text (e.g., "Sri Lanka opt to bowl")
+                    toss_winner, toss_decision = _parse_toss_from_status(
+                        m.get("status", ""), m.get("teams", [])
+                    )
 
                 # Match has started — transition to LIVE_1ST (from UPCOMING or TOSS)
                 if match_started or "inning" in api_status:
                     await match_service.update_match_status(match["_id"], MatchStatus.LIVE_1ST)
-                    if m.get("tossWinner"):
+                    if toss_winner:
                         await db.matches.update_one(
                             {"_id": match["_id"]},
                             {"$set": {
-                                "toss_winner": m.get("tossWinner"),
-                                "toss_decision": m.get("tossChoice"),
+                                "toss_winner": toss_winner,
+                                "toss_decision": toss_decision,
                             }},
                         )
                     await emit_match_status_change(match["_id"], MatchStatus.LIVE_1ST)
@@ -111,18 +124,24 @@ async def _check_upcoming_matches(current_matches: list[dict]) -> None:
                     await emit_prediction_window(match["_id"], True, "1.1.1")
                     logger.info(f"Match {match['_id']}: {prev_status} → LIVE_1ST")
 
+                # Match ended while still upcoming/toss (abandoned before play)
+                elif match_ended:
+                    await _finalize_ended_match(match, m)
+                    logger.info(f"Match {match['_id']}: {prev_status} → ended (abandoned/completed)")
+
                 # Toss done but match not started yet (only for UPCOMING)
-                elif prev_status == MatchStatus.UPCOMING and m.get("tossWinner") and not match_started:
+                elif prev_status == MatchStatus.UPCOMING and toss_detected and not match_started:
                     await match_service.update_match_status(match["_id"], MatchStatus.TOSS)
+                    update_fields = {"result_text": m.get("status", "")}
+                    if toss_winner:
+                        update_fields["toss_winner"] = toss_winner
+                        update_fields["toss_decision"] = toss_decision
                     await db.matches.update_one(
                         {"_id": match["_id"]},
-                        {"$set": {
-                            "toss_winner": m.get("tossWinner"),
-                            "toss_decision": m.get("tossChoice"),
-                        }},
+                        {"$set": update_fields},
                     )
                     await emit_match_status_change(match["_id"], MatchStatus.TOSS)
-                    logger.info(f"Match {match['_id']}: UPCOMING → TOSS")
+                    logger.info(f"Match {match['_id']}: UPCOMING → TOSS ({m.get('status', '')})")
                 break
         except Exception as e:
             logger.error(f"Error checking upcoming match {match['_id']}: {e}", exc_info=True)
@@ -354,3 +373,35 @@ def _extract_winner(cricapi_match: dict) -> str:
             if "won" in status.lower():
                 return name
     return ""
+
+
+def _parse_toss_from_status(status_text: str, teams: list[str]) -> tuple[str, str]:
+    """Parse toss winner and decision from CricAPI status text.
+
+    Examples: "Sri Lanka opt to bowl", "England elected to bat first"
+    Returns (toss_winner, toss_decision) or ("", "").
+    """
+    s = status_text.lower()
+    decision = ""
+    if "opt to bat" in s or "elected to bat" in s or "chose to bat" in s:
+        decision = "bat"
+    elif "opt to bowl" in s or "elected to bowl" in s or "chose to bowl" in s or "elected to field" in s:
+        decision = "bowl"
+
+    if not decision:
+        return "", ""
+
+    # Try to find which team from the status text
+    for team in teams:
+        if team.lower() in s:
+            return team, decision
+
+    # Fallback: the text before "opt"/"elected"/"chose" is likely the team name
+    for keyword in ["opt to", "elected to", "chose to"]:
+        if keyword in s:
+            team_part = s.split(keyword)[0].strip()
+            if team_part:
+                # Capitalise properly
+                return status_text[:len(team_part)].strip(), decision
+
+    return "", decision
