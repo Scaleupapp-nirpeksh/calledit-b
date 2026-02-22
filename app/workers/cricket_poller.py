@@ -246,11 +246,6 @@ async def _sync_from_current_matches(match: dict, current_matches: list[dict]) -
     from app.database import get_db
     db = get_db()
 
-    # Always update the score in DB
-    update = {"score": score, "result_text": api_status, "updated_at": utc_now()}
-    await db.matches.update_one({"_id": match_id}, {"$set": update})
-    await emit_score_update(match_id, {"score": score, "status_text": api_status})
-
     # --- Ball inference: detect new balls from overs changing ---
     redis = get_redis()
     snapshot_key = f"score_snapshot:{match_id}"
@@ -270,6 +265,10 @@ async def _sync_from_current_matches(match: dict, current_matches: list[dict]) -
         # First time — save snapshot and open prediction window for current ball
         prev = {"r": cur_r, "w": cur_w, "o": cur_o, "innings": cur_innings_idx}
         await redis.set(snapshot_key, json.dumps(prev))
+        # Update score in DB
+        update = {"score": score, "result_text": api_status, "updated_at": utc_now()}
+        await db.matches.update_one({"_id": match_id}, {"$set": update})
+        await emit_score_update(match_id, {"score": score, "status_text": api_status})
         # Open window for the next ball
         next_over, next_ball = _next_ball_from_overs(cur_o)
         now = utc_now()
@@ -288,14 +287,21 @@ async def _sync_from_current_matches(match: dict, current_matches: list[dict]) -
     prev_w = prev.get("w", 0)
     prev_innings = prev.get("innings", 1)
 
-    # Check if innings changed
-    innings_changed = cur_innings_idx != prev_innings
+    # Check if innings changed (forward only)
+    innings_changed = cur_innings_idx > prev_innings
 
-    # Check if overs changed (new ball bowled)
-    overs_changed = cur_o != prev_o or innings_changed
+    # Guard: only process when score has PROGRESSED (overs increased, not bounced)
+    # CricAPI currentMatches can return stale/cached data causing score to appear to go backwards
+    if not innings_changed:
+        if cur_innings_idx < prev_innings:
+            return  # Stale data — innings went backwards
+        if cur_o <= prev_o:
+            return  # No new ball or stale data — overs same or went backwards
 
-    if not overs_changed:
-        return  # No new ball, nothing to do
+    # Score progressed — update DB and emit
+    update = {"score": score, "result_text": api_status, "updated_at": utc_now()}
+    await db.matches.update_one({"_id": match_id}, {"$set": update})
+    await emit_score_update(match_id, {"score": score, "status_text": api_status})
 
     # --- A ball (or multiple balls) was bowled ---
     # Infer the ball that just happened
