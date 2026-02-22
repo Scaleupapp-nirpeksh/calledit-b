@@ -290,6 +290,7 @@ def _format_match(m: dict) -> dict:
         "current_innings": m.get("current_innings"),
         "current_over": m.get("current_over"),
         "current_ball": m.get("current_ball"),
+        "ball_log": m.get("ball_log", []),
         "created_at": m.get("created_at"),
         "updated_at": m.get("updated_at"),
     }
