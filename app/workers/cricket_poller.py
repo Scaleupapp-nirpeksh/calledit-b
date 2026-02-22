@@ -154,24 +154,27 @@ async def _poll_match(match: dict, current_matches: list[dict]) -> None:
     if not cricapi_id:
         return
 
+    # First, sync status & scores from currentMatches (always available)
+    await _sync_from_current_matches(match, current_matches)
+
+    # Then try ball-by-ball data (not always available — bbbEnabled can be false)
     redis = get_redis()
     ball_count_key = f"match_balls:{match_id}"
-
-    # Get current ball count
     prev_count = int(await redis.get(ball_count_key) or 0)
 
-    # Fetch latest ball-by-ball data from CricAPI
     bbb_data = await cricket_data_service.fetch_match_ball_by_ball(cricapi_id)
     if not bbb_data:
-        # No bbb data — could be abandoned/no play. Check currentMatches for status.
-        await _check_live_match_ended(match, current_matches)
-        return
+        return  # Status already handled by _sync_from_current_matches
 
     # Detect new deliveries
     new_deliveries = cricket_data_service.detect_new_deliveries(prev_count, bbb_data)
     if not new_deliveries:
-        # Check for match status changes even if no new balls
-        await _check_status_change(match, bbb_data, current_matches)
+        # Check for innings break via bbb data
+        num_innings = len(bbb_data.get("bbb", []))
+        if match.get("status") == MatchStatus.LIVE_1ST and num_innings >= 2:
+            await match_service.update_match_status(match_id, MatchStatus.LIVE_2ND)
+            await emit_match_status_change(match_id, MatchStatus.LIVE_2ND)
+            logger.info(f"Match {match_id}: Innings break → 2nd innings (bbb)")
         return
 
     logger.info(f"Match {match_id}: {len(new_deliveries)} new deliveries detected")
@@ -182,6 +185,58 @@ async def _poll_match(match: dict, current_matches: list[dict]) -> None:
     # Update ball count in Redis
     new_total = prev_count + len(new_deliveries)
     await redis.set(ball_count_key, new_total)
+
+
+async def _sync_from_current_matches(match: dict, current_matches: list[dict]) -> None:
+    """Sync match status and scores from currentMatches API data.
+    This handles all status transitions and score updates regardless of bbb availability."""
+    match_id = match["_id"]
+    cricapi_id = match.get("cricapi_id")
+    current_status = match.get("status")
+
+    cricapi_match = None
+    for m in current_matches:
+        if m.get("id") == cricapi_id:
+            cricapi_match = m
+            break
+    if not cricapi_match:
+        return
+
+    match_started = cricapi_match.get("matchStarted", False)
+    match_ended = cricapi_match.get("matchEnded", False)
+    api_status = cricapi_match.get("status", "")
+    score = cricapi_match.get("score", [])
+
+    # --- Status transitions ---
+
+    # Match ended → completed or abandoned
+    if match_ended:
+        if current_status not in (MatchStatus.COMPLETED, MatchStatus.ABANDONED):
+            await _finalize_ended_match(match, cricapi_match)
+        return
+
+    # Toss → LIVE_1ST when matchStarted becomes true
+    if current_status == MatchStatus.TOSS and match_started:
+        await match_service.update_match_status(match_id, MatchStatus.LIVE_1ST)
+        await emit_match_status_change(match_id, MatchStatus.LIVE_1ST)
+        await match_service.open_prediction_window(match_id)
+        await emit_prediction_window(match_id, True, "1.1.1")
+        logger.info(f"Match {match_id}: TOSS → LIVE_1ST")
+        current_status = MatchStatus.LIVE_1ST
+
+    # Detect innings break from score data (2 innings present)
+    if current_status == MatchStatus.LIVE_1ST and len(score) >= 2:
+        await match_service.update_match_status(match_id, MatchStatus.LIVE_2ND)
+        await emit_match_status_change(match_id, MatchStatus.LIVE_2ND)
+        logger.info(f"Match {match_id}: LIVE_1ST → LIVE_2ND (innings break)")
+
+    # --- Score updates from currentMatches (works even without bbb) ---
+    if score:
+        from app.database import get_db
+        db = get_db()
+        update = {"score": score, "result_text": api_status, "updated_at": utc_now()}
+        await db.matches.update_one({"_id": match_id}, {"$set": update})
+        await emit_score_update(match_id, {"score": score, "status_text": api_status})
 
 
 async def _process_delivery(match_id: str, delivery: dict) -> None:
@@ -285,21 +340,6 @@ async def _handle_over_complete(match_id: str, innings: int, over: int) -> None:
         logger.warning(f"Over summary generation error: {e}")
 
 
-async def _check_live_match_ended(match: dict, current_matches: list[dict]) -> None:
-    """Check currentMatches data for a live match that may have ended (abandoned, no play, etc.)."""
-    cricapi_id = match.get("cricapi_id")
-    if not cricapi_id:
-        return
-
-    for m in current_matches:
-        if m.get("id") != cricapi_id:
-            continue
-
-        if m.get("matchEnded"):
-            await _finalize_ended_match(match, m)
-        break
-
-
 async def _finalize_ended_match(match: dict, cricapi_match: dict) -> None:
     """Handle a match that CricAPI reports as ended (completed or abandoned)."""
     match_id = match["_id"]
@@ -336,29 +376,6 @@ async def _finalize_ended_match(match: dict, cricapi_match: dict) -> None:
         )
         await emit_match_status_change(match_id, MatchStatus.ABANDONED)
         logger.info(f"Match {match_id} abandoned: {status_text}")
-
-
-async def _check_status_change(match: dict, bbb_data: dict, current_matches: list[dict]) -> None:
-    """Check if match status has changed (e.g., innings break, completed)."""
-    match_id = match["_id"]
-    current_status = match.get("status")
-
-    # Detect innings break
-    innings_data = bbb_data.get("bbb", [])
-    num_innings = len(innings_data)
-
-    if current_status == MatchStatus.LIVE_1ST and num_innings >= 2:
-        await match_service.update_match_status(match_id, MatchStatus.LIVE_2ND)
-        await emit_match_status_change(match_id, MatchStatus.LIVE_2ND)
-        logger.info(f"Match {match_id}: Innings break → 2nd innings")
-
-    # Detect match completion via currentMatches data
-    cricapi_id = match.get("cricapi_id")
-    if cricapi_id:
-        for m in current_matches:
-            if m.get("id") == cricapi_id and m.get("matchEnded"):
-                await _finalize_ended_match(match, m)
-                break
 
 
 def _extract_winner(cricapi_match: dict) -> str:
