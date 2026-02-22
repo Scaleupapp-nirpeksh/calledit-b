@@ -52,8 +52,11 @@ def stop_poller() -> None:
 
 async def _poll_cycle() -> None:
     """Single polling cycle: check upcoming matches for start + live matches for new deliveries."""
+    # Fetch currentMatches once per cycle (shared across all checks)
+    current_matches = await cricket_data_service.fetch_current_matches()
+
     # Check upcoming matches that may have started
-    await _check_upcoming_matches()
+    await _check_upcoming_matches(current_matches)
 
     live_matches = await match_service.get_live_matches()
     if not live_matches:
@@ -61,24 +64,29 @@ async def _poll_cycle() -> None:
 
     for match in live_matches:
         try:
-            await _poll_match(match)
+            await _poll_match(match, current_matches)
         except Exception as e:
             logger.error(f"Error polling match {match['_id']}: {e}", exc_info=True)
 
 
-async def _check_upcoming_matches() -> None:
+async def _check_upcoming_matches(current_matches: list[dict]) -> None:
     """Check if any upcoming matches have started (toss done, play started)."""
+    if not current_matches:
+        return
+
     from app.database import get_db
     db = get_db()
     upcoming = await db.matches.find(
         {"status": {"$in": [MatchStatus.UPCOMING, MatchStatus.TOSS]}, "cricapi_id": {"$ne": None}}
     ).to_list(length=50)
 
+    if not upcoming:
+        return
+
     for match in upcoming:
         try:
             cricapi_id = match["cricapi_id"]
-            matches_data = await cricket_data_service.fetch_current_matches()
-            for m in matches_data:
+            for m in current_matches:
                 if m.get("id") != cricapi_id:
                     continue
 
@@ -120,7 +128,7 @@ async def _check_upcoming_matches() -> None:
             logger.error(f"Error checking upcoming match {match['_id']}: {e}", exc_info=True)
 
 
-async def _poll_match(match: dict) -> None:
+async def _poll_match(match: dict, current_matches: list[dict]) -> None:
     """Poll a single live match for new deliveries."""
     match_id = match["_id"]
     cricapi_id = match.get("cricapi_id")
@@ -137,14 +145,14 @@ async def _poll_match(match: dict) -> None:
     bbb_data = await cricket_data_service.fetch_match_ball_by_ball(cricapi_id)
     if not bbb_data:
         # No bbb data — could be abandoned/no play. Check currentMatches for status.
-        await _check_live_match_ended(match)
+        await _check_live_match_ended(match, current_matches)
         return
 
     # Detect new deliveries
     new_deliveries = cricket_data_service.detect_new_deliveries(prev_count, bbb_data)
     if not new_deliveries:
         # Check for match status changes even if no new balls
-        await _check_status_change(match, bbb_data)
+        await _check_status_change(match, bbb_data, current_matches)
         return
 
     logger.info(f"Match {match_id}: {len(new_deliveries)} new deliveries detected")
@@ -258,14 +266,13 @@ async def _handle_over_complete(match_id: str, innings: int, over: int) -> None:
         logger.warning(f"Over summary generation error: {e}")
 
 
-async def _check_live_match_ended(match: dict) -> None:
-    """Check currentMatches API for a live match that may have ended (abandoned, no play, etc.)."""
+async def _check_live_match_ended(match: dict, current_matches: list[dict]) -> None:
+    """Check currentMatches data for a live match that may have ended (abandoned, no play, etc.)."""
     cricapi_id = match.get("cricapi_id")
     if not cricapi_id:
         return
 
-    matches_data = await cricket_data_service.fetch_current_matches()
-    for m in matches_data:
+    for m in current_matches:
         if m.get("id") != cricapi_id:
             continue
 
@@ -312,7 +319,7 @@ async def _finalize_ended_match(match: dict, cricapi_match: dict) -> None:
         logger.info(f"Match {match_id} abandoned: {status_text}")
 
 
-async def _check_status_change(match: dict, bbb_data: dict) -> None:
+async def _check_status_change(match: dict, bbb_data: dict, current_matches: list[dict]) -> None:
     """Check if match status has changed (e.g., innings break, completed)."""
     match_id = match["_id"]
     current_status = match.get("status")
@@ -326,11 +333,10 @@ async def _check_status_change(match: dict, bbb_data: dict) -> None:
         await emit_match_status_change(match_id, MatchStatus.LIVE_2ND)
         logger.info(f"Match {match_id}: Innings break → 2nd innings")
 
-    # Detect match completion via currentMatches API
+    # Detect match completion via currentMatches data
     cricapi_id = match.get("cricapi_id")
     if cricapi_id:
-        matches = await cricket_data_service.fetch_current_matches()
-        for m in matches:
+        for m in current_matches:
             if m.get("id") == cricapi_id and m.get("matchEnded"):
                 await _finalize_ended_match(match, m)
                 break
