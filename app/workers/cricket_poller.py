@@ -136,6 +136,8 @@ async def _poll_match(match: dict) -> None:
     # Fetch latest ball-by-ball data from CricAPI
     bbb_data = await cricket_data_service.fetch_match_ball_by_ball(cricapi_id)
     if not bbb_data:
+        # No bbb data — could be abandoned/no play. Check currentMatches for status.
+        await _check_live_match_ended(match)
         return
 
     # Detect new deliveries
@@ -256,6 +258,60 @@ async def _handle_over_complete(match_id: str, innings: int, over: int) -> None:
         logger.warning(f"Over summary generation error: {e}")
 
 
+async def _check_live_match_ended(match: dict) -> None:
+    """Check currentMatches API for a live match that may have ended (abandoned, no play, etc.)."""
+    cricapi_id = match.get("cricapi_id")
+    if not cricapi_id:
+        return
+
+    matches_data = await cricket_data_service.fetch_current_matches()
+    for m in matches_data:
+        if m.get("id") != cricapi_id:
+            continue
+
+        if m.get("matchEnded"):
+            await _finalize_ended_match(match, m)
+        break
+
+
+async def _finalize_ended_match(match: dict, cricapi_match: dict) -> None:
+    """Handle a match that CricAPI reports as ended (completed or abandoned)."""
+    match_id = match["_id"]
+    status_text = cricapi_match.get("status", "")
+    winner = _extract_winner(cricapi_match)
+
+    # Close prediction window
+    await match_service.close_prediction_window(match_id)
+
+    if winner:
+        # Normal completion with a winner
+        await match_service.complete_match(match_id, winner, status_text)
+        await emit_match_status_change(match_id, MatchStatus.COMPLETED)
+        await process_match_result(match_id, winner)
+        logger.info(f"Match {match_id} completed. Winner: {winner}")
+
+        try:
+            from app.services.ai_content_service import generate_post_match_report
+            await generate_post_match_report(match_id)
+        except Exception as e:
+            logger.warning(f"Post-match report error: {e}")
+    else:
+        # No winner — abandoned, no result, rain, etc.
+        from app.database import get_db
+        db = get_db()
+        await db.matches.update_one(
+            {"_id": match_id},
+            {"$set": {
+                "status": MatchStatus.ABANDONED,
+                "result_text": status_text or "Match abandoned",
+                "prediction_window_open": False,
+                "updated_at": utc_now(),
+            }},
+        )
+        await emit_match_status_change(match_id, MatchStatus.ABANDONED)
+        logger.info(f"Match {match_id} abandoned: {status_text}")
+
+
 async def _check_status_change(match: dict, bbb_data: dict) -> None:
     """Check if match status has changed (e.g., innings break, completed)."""
     match_id = match["_id"]
@@ -270,25 +326,13 @@ async def _check_status_change(match: dict, bbb_data: dict) -> None:
         await emit_match_status_change(match_id, MatchStatus.LIVE_2ND)
         logger.info(f"Match {match_id}: Innings break → 2nd innings")
 
-    # Detect match completion
+    # Detect match completion via currentMatches API
     cricapi_id = match.get("cricapi_id")
     if cricapi_id:
         matches = await cricket_data_service.fetch_current_matches()
         for m in matches:
             if m.get("id") == cricapi_id and m.get("matchEnded"):
-                winner = _extract_winner(m)
-                if winner:
-                    await match_service.complete_match(match_id, winner, m.get("status", ""))
-                    await emit_match_status_change(match_id, MatchStatus.COMPLETED)
-                    await process_match_result(match_id, winner)
-                    logger.info(f"Match {match_id} completed. Winner: {winner}")
-
-                    # Trigger post-match report
-                    try:
-                        from app.services.ai_content_service import generate_post_match_report
-                        await generate_post_match_report(match_id)
-                    except Exception as e:
-                        logger.warning(f"Post-match report error: {e}")
+                await _finalize_ended_match(match, m)
                 break
 
 

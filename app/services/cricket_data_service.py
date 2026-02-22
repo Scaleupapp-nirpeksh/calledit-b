@@ -300,6 +300,13 @@ def _map_cricapi_status(match: dict) -> str:
     elif started and not ended:
         return MatchStatus.LIVE_1ST  # Refined by poller based on innings data
     elif started and ended:
+        # Check if abandoned/no result vs normal completion
+        status_text = match.get("status", "").lower()
+        abandon_keywords = ["abandon", "no result", "no match", "cancelled", "postponed"]
+        if any(kw in status_text for kw in abandon_keywords):
+            return MatchStatus.ABANDONED
+        if not match.get("matchWinner") and "won" not in status_text:
+            return MatchStatus.ABANDONED
         return MatchStatus.COMPLETED
     return MatchStatus.UPCOMING
 
